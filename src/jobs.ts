@@ -94,6 +94,34 @@ function marker(job: Job): string {
   return `__PI_REMOTE_JOB_${job.id}__`;
 }
 
+/** States after which the job will not run again on its own. */
+const TERMINAL_STATES = new Set([
+  "BOOT_FAIL",
+  "CANCELLED",
+  "COMPLETED",
+  "DEADLINE",
+  "FAILED",
+  "NODE_FAIL",
+  "OUT_OF_MEMORY",
+  "REVOKED",
+  "TIMEOUT",
+]);
+
+/**
+ * True only when the remote side confirmed that the job is over.
+ * Anything unreadable (`unknown`, a failed query) is not finished, and neither is
+ * a state that may still be requeued.
+ */
+export function isTerminalState(state: string): boolean {
+  // Slurm status lines start with the job id, and `sacct` appends "CANCELLED by 1234".
+  const [word] = state
+    .trim()
+    .replace(/^\d+\s+/, "")
+    .split(/\s+/);
+  if (!word) return false;
+  return TERMINAL_STATES.has(word.toUpperCase());
+}
+
 /** sshd rejects one argv string beyond 128 KiB, so keep batches well below it. */
 const STATUS_BATCH_BYTES = 32 * 1024;
 
@@ -242,8 +270,11 @@ export function registerJobs(
     return states;
   }
 
-  async function list(signal?: AbortSignal) {
-    const { jobs, warnings } = records();
+  /** Per-host states in parallel; a host that fails reports why, per job. */
+  async function queryStates(
+    jobs: Job[],
+    signal?: AbortSignal,
+  ): Promise<Map<string, string>> {
     const groups = new Map<string, Job[]>();
     for (const job of jobs) {
       const group = groups.get(job.host) ?? [];
@@ -254,23 +285,56 @@ export function registerJobs(
     await Promise.all(
       [...groups].map(async ([host, hostJobs]) => {
         try {
-          const hostStates = await batchStatus(host, hostJobs, signal);
-          for (const [id, state] of hostStates) states.set(id, state);
+          for (const [id, state] of await batchStatus(host, hostJobs, signal))
+            states.set(id, state);
         } catch (error) {
           for (const job of hostJobs)
             states.set(job.id, `unknown: ${String(error)}`);
         }
       }),
     );
+    return states;
+  }
+
+  async function list(signal?: AbortSignal) {
+    const { jobs, warnings } = records();
+    const states = await queryStates(jobs, signal);
+    const finished = new Set(
+      jobs
+        .filter((job) => isTerminalState(states.get(job.id) ?? ""))
+        .map((job) => job.id),
+    );
     const lines = jobs.map(
       (job) =>
-        `${job.id}  ${job.name}  ${job.host}  ${job.backend}  ${states.get(job.id) ?? "unknown"}`,
+        `${job.id}  ${job.name}  ${job.host}  ${job.backend}  ${states.get(job.id) ?? "unknown"}${finished.has(job.id) ? "  (finished)" : ""}`,
     );
+    const hint = finished.size
+      ? [
+          `[${finished.size} finished jobs. remote_job(action="forget", finished=true) removes their local records.]`,
+        ]
+      : [];
     return (
-      [...warnings.map((warning) => `[warning] ${warning}`), ...lines].join(
-        "\n",
-      ) || "No registered jobs."
+      [
+        ...warnings.map((warning) => `[warning] ${warning}`),
+        ...lines,
+        ...hint,
+      ].join("\n") || "No registered jobs."
     );
+  }
+
+  /** Remove only records the remote side confirmed are over. */
+  async function forgetFinished(signal?: AbortSignal): Promise<string> {
+    const { jobs } = records();
+    if (!jobs.length) return "No registered jobs.";
+    const states = await queryStates(jobs, signal);
+    const removed = jobs.filter((job) =>
+      isTerminalState(states.get(job.id) ?? ""),
+    );
+    for (const job of removed) unlinkSync(join(dir, `${job.id}.json`));
+    if (!removed.length)
+      return "No job was confirmed finished. No record was removed.";
+    const kept = jobs.length - removed.length;
+    return `Removed ${removed.length} finished jobs; ${kept} records kept because the remote state is running or unconfirmed. Remote work was not cancelled.`;
   }
 
   pi.registerTool({
@@ -279,7 +343,8 @@ export function registerJobs(
     description:
       "Submit and track long-running jobs. Choose slurm explicitly for existing sbatch scripts " +
       "(stdout/stderr routed to private job logs); process for detached Linux shell commands. " +
-      "No automatic fallback. Logs reads the remote tail only. Forget removes only the local registration and never cancels remote work.",
+      "No automatic fallback. Logs reads the remote tail only. Forget removes only the local registration and never cancels remote work; " +
+      "forget with finished=true removes only records the remote side confirmed are over.",
     promptSnippet: "Submit, list, inspect or cancel durable remote tasks by ID",
     parameters: Type.Object({
       action: StringEnum(
@@ -317,6 +382,12 @@ export function registerJobs(
             "Job UUID returned by submit; required for status, logs, cancel and forget.",
         }),
       ),
+      finished: Type.Optional(
+        Type.Boolean({
+          description:
+            "With forget: remove every record whose remote state is confirmed finished. Running or unreadable records are kept. Cannot be combined with id.",
+        }),
+      ),
     }),
     async execute(_id, params, signal) {
       let text: string;
@@ -346,6 +417,10 @@ export function registerJobs(
             `Submission not confirmed. Check ${job.id} before retrying: ${String(error)}`,
           );
         }
+      } else if (params.action === "forget" && params.finished) {
+        if (params.id)
+          throw new Error("forget takes either id or finished, not both");
+        text = await forgetFinished(signal);
       } else {
         const { jobs } = records();
         const job = jobs.find((job) => job.id === params.id);

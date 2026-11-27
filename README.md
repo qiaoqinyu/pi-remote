@@ -17,14 +17,14 @@ The local machine needs `ssh` and, for `remote_sync`, `rsync` 3.1 or newer (macO
 - On timeout (default 120 s) or Esc, a remote Python 3.8+ supervisor sends TERM then KILL to the command's process group. If SSH cannot deliver the acknowledgement, the result says the remote state is unknown; the supervisor also enforces its own deadline. A host without `python3` exits with code 96 and an explicit prerequisite error rather than `ssh failed`.
 - If the main command exits but a background child keeps stdout or stderr open, the supervisor reports that condition after a short grace period instead of waiting for the deadline. Redirect detached processes or use `remote_job`.
 - `remote_sync(host, direction, local, remote, exclude?, timeout?)` runs `rsync -az --partial --stats` over the same connection. It never deletes files. A relative remote path resolves against the remembered directory. The default timeout is 600 s and can be changed per call. Timeout and cancellation messages explain that partial files are kept and retrying resumes the transfer.
-- `remote_job` submits long work with an explicit `slurm` or `process` backend. Use the returned UUID for `status`, `logs`, or `cancel`. `forget` removes only local registration metadata; it does not cancel remote work.
+- `remote_job` submits long work with an explicit `slurm` or `process` backend. Use the returned UUID for `status`, `logs`, or `cancel`. `forget` removes only local registration metadata; it does not cancel remote work. `forget` with `finished: true` removes every record the remote side confirmed is over, and keeps the rest.
 
 ## Connections
 
 Each host gets its own ControlMaster socket in `~/.pi/agent/remote/<alias>`, separate from the `~/.ssh/ctrl-*` sockets used by terminals. A master exits after 30 minutes idle. Quitting one Pi session does not stop the shared master.
 
 - `/remote` or `/remote list`: shows each host, master PID, stale socket or check error, and remembered cwd.
-- `/remote jobs`: shows every registered job, newest first, with its current state.
+- `/remote jobs`: shows every registered job, newest first, with its current state. Jobs the remote side confirmed are over are marked `(finished)`.
 - `/remote refresh`: checks all sockets and removes stale ones without closing live connections.
 - `/remote disconnect <host|all>`: closes the selected masters immediately and removes stale sockets. `/remote close` is an alias. Disconnecting ends commands running over that master but does not cancel submitted jobs.
 - A host can be disconnected by its old alias after it is renamed or removed from SSH config. If the SSH control command cannot handle the old alias, Pi terminates the master PID obtained from that exact Pi-owned socket.
@@ -35,7 +35,7 @@ The footer shows `remote: <hosts>` while sockets exist and refreshes every 60 se
 
 Slurm uses the submitted script's resource directives. Job stdout/stderr go to private files under `$HOME/.local/state/pi-remote/jobs/<id>/` (HOME must be shared with compute nodes). The log action reads only the last 100 lines per file. Only registration metadata is stored locally in `remote-jobs/`.
 
-Job status uses one SSH invocation per batch, with different hosts queried in parallel and the jobs of one host split into batches that stay well inside the command size limit. An unreachable host does not delay other hosts. Corrupt local records produce warnings instead of blocking the whole list. Local records are never deleted automatically; use `remote_job(action="forget", id=...)` to remove finished registrations.
+Job status uses one SSH invocation per batch, with different hosts queried in parallel and the jobs of one host split into batches that stay well inside the command size limit. An unreachable host does not delay other hosts. Corrupt local records produce warnings instead of blocking the whole list. Local records are never deleted on their own. A record is marked `(finished)` only when a successful query reported a terminal state, and `remote_job(action="forget", finished=true)` removes exactly those records. A preempted job may be requeued, and an unreadable state is never terminal, so neither loses its record. Cleanup happens when you ask for it, because listing is the only time a state is observed.
 
 Large command output uses `remote-output-cache/` in the Pi agent directory. There are 64 shared slots of 16 MiB each (1 GiB total); stdout and stderr may each occupy one slot. Once full, previews still work, but the full stream is not saved. Entries older than seven days and orphan slots older than one hour are pruned. Remote logs and project files are never pruned.
 

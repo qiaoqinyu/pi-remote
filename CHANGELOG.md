@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- `/remote jobs` marks jobs whose remote state is terminal with `(finished)` and
+  says how many there are.
+- `remote_job(action="forget", finished=true)` removes every record the remote
+  side confirmed is over, in one call. Running jobs, jobs whose state could not
+  be read, and preempted jobs that may be requeued keep their records. The
+  remote side is queried with the same batched status calls as the listing.
+
+### Changed
+
+- Job state classification lives in one place (`isTerminalState`), so the marker
+  and the cleanup can never disagree about what "finished" means.
+
 ## 0.2.0
 
 ### Fixed

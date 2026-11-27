@@ -584,3 +584,182 @@ test("remote throttles preview updates and still shows the final output", async 
     t.cleanup();
   }
 });
+
+/**
+ * A host whose jobs report a mix of states: one finished process job, one
+ * process job that vanished without a result, one finished Slurm job and one
+ * Slurm job that is still running.
+ */
+function jobWorld(t: ReturnType<typeof setup>) {
+  const bin = join(t.dir, "bin");
+  const home = join(t.dir, "home");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(bin, "ssh"), '#!/bin/bash\nexec sh -c "${!#}"\n', {
+    mode: 0o700,
+  });
+  writeFileSync(
+    join(bin, "squeue"),
+    '#!/bin/bash\ncase "$*" in *22222*) printf "RUNNING\\n" ;; *) exit 1 ;; esac\n',
+    { mode: 0o700 },
+  );
+  writeFileSync(
+    join(bin, "sacct"),
+    '#!/bin/bash\ncase "$*" in *12345*) printf "COMPLETED\\n" ;; *) exit 1 ;; esac\n',
+    { mode: 0o700 },
+  );
+
+  const jobsDir = join(t.dir, "remote-jobs");
+  mkdirSync(jobsDir, { recursive: true });
+  const ids = {
+    processDone: randomUUID(),
+    processUnknown: randomUUID(),
+    slurmDone: randomUUID(),
+    slurmRunning: randomUUID(),
+  };
+  const records = [
+    [ids.processDone, "process-done", "process"],
+    [ids.processUnknown, "process-unknown", "process"],
+    [ids.slurmDone, "slurm-done", "slurm"],
+    [ids.slurmRunning, "slurm-running", "slurm"],
+  ] as const;
+  for (const [id, name, backend] of records)
+    writeFileSync(
+      join(jobsDir, `${id}.json`),
+      JSON.stringify({ id, host: "h1", name, backend }),
+    );
+
+  const remote = (id: string, file: string, content: string) => {
+    const jobDir = join(home, ".local", "state", "pi-remote", "jobs", id);
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(join(jobDir, file), content);
+  };
+  remote(ids.processDone, "result", "completed 0\n");
+  remote(ids.slurmDone, "slurm", "12345\n");
+  remote(ids.slurmRunning, "slurm", "22222\n");
+
+  return {
+    ids,
+    recordPath: (id: string) => join(jobsDir, `${id}.json`),
+    /** Run a tool call with the fake host's HOME in place. */
+    run: async <T>(fn: () => Promise<T>): Promise<T> => {
+      const oldPath = process.env.PATH;
+      const oldHome = process.env.HOME;
+      process.env.PATH = `${bin}:${oldPath}`;
+      process.env.HOME = home;
+      try {
+        return await fn();
+      } finally {
+        process.env.PATH = oldPath;
+        if (oldHome === undefined) delete process.env.HOME;
+        else process.env.HOME = oldHome;
+      }
+    },
+  };
+}
+
+test("remote_job marks jobs the remote side confirmed as finished", async () => {
+  const t = setup();
+  try {
+    const world = jobWorld(t);
+    const listed = await world.run(() =>
+      t.tools
+        .get("remote_job")!
+        .execute("id", { action: "list" }, undefined, undefined, t.ctx),
+    );
+    const line = (name: string) =>
+      listed.content[0].text
+        .split("\n")
+        .find((row) => row.includes(` ${name} `))!;
+    assert.match(line("process-done"), /completed 0\s+\(finished\)$/);
+    assert.match(line("slurm-done"), /12345 COMPLETED\s+\(finished\)$/);
+    assert.doesNotMatch(line("process-unknown"), /\(finished\)/);
+    assert.doesNotMatch(line("slurm-running"), /\(finished\)/);
+    assert.match(
+      listed.content[0].text,
+      /2 finished jobs.*forget.*finished=true/,
+    );
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote_job forget finished removes only confirmed terminal records", async () => {
+  const t = setup();
+  try {
+    const world = jobWorld(t);
+    const forgotten = await world.run(() =>
+      t.tools
+        .get("remote_job")!
+        .execute(
+          "id",
+          { action: "forget", finished: true },
+          undefined,
+          undefined,
+          t.ctx,
+        ),
+    );
+    const text = forgotten.content[0].text;
+    assert.match(text, /Removed 2 finished jobs/);
+    assert.match(text, /2 records kept/);
+    assert.match(text, /not cancelled/);
+    assert.equal(existsSync(world.recordPath(world.ids.processDone)), false);
+    assert.equal(existsSync(world.recordPath(world.ids.slurmDone)), false);
+    assert.equal(existsSync(world.recordPath(world.ids.processUnknown)), true);
+    assert.equal(existsSync(world.recordPath(world.ids.slurmRunning)), true);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote_job forget keeps every record when the host cannot be reached", async () => {
+  const t = setup();
+  try {
+    const world = jobWorld(t);
+    writeFileSync(
+      join(t.dir, "bin", "ssh"),
+      "#!/bin/bash\nprintf 'ssh: connect refused\\n' >&2\nexit 255\n",
+      { mode: 0o700 },
+    );
+    const forgotten = await world.run(() =>
+      t.tools
+        .get("remote_job")!
+        .execute(
+          "id",
+          { action: "forget", finished: true },
+          undefined,
+          undefined,
+          t.ctx,
+        ),
+    );
+    assert.match(forgotten.content[0].text, /No job was confirmed finished/);
+    for (const id of Object.values(world.ids))
+      assert.equal(existsSync(world.recordPath(id)), true);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote_job forget rejects id together with finished", async () => {
+  const t = setup();
+  try {
+    const world = jobWorld(t);
+    await assert.rejects(
+      world.run(() =>
+        t.tools
+          .get("remote_job")!
+          .execute(
+            "id",
+            { action: "forget", id: world.ids.processDone, finished: true },
+            undefined,
+            undefined,
+            t.ctx,
+          ),
+      ),
+      /either id or finished/,
+    );
+    assert.equal(existsSync(world.recordPath(world.ids.processDone)), true);
+  } finally {
+    t.cleanup();
+  }
+});

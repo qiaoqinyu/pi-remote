@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { jobCommand } from "../src/jobs.ts";
+import { isTerminalState, jobCommand } from "../src/jobs.ts";
 
 test("detached task records exit code and limits the log query", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-job-test-"));
@@ -105,4 +105,34 @@ test("slurm status and cancel read the job id and cluster from the record", () =
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("only confirmed terminal states count as finished", () => {
+  for (const state of [
+    "completed 0",
+    "failed 7",
+    "cancelled 0",
+    "12345 COMPLETED",
+    "12345 FAILED",
+    "12345 CANCELLED by 1234",
+    "12345 TIMEOUT",
+    "12345 OUT_OF_MEMORY",
+    "12345 NODE_FAIL",
+  ])
+    assert.equal(isTerminalState(state), true, state);
+  for (const state of [
+    "running",
+    "12345 RUNNING",
+    "12345 PENDING",
+    "12345 COMPLETING",
+    "12345 SUSPENDED",
+    // A preempted job may be requeued, so its record stays.
+    "12345 PREEMPTED",
+    "12345 REQUEUED",
+    "unknown",
+    "unknown: Status request failed (255)",
+    "unknown: status command exited 1",
+    "",
+  ])
+    assert.equal(isTerminalState(state), false, state);
 });
