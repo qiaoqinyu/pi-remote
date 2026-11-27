@@ -32,6 +32,10 @@
 - `test/link-deps.mjs` skips linking when no Pi install is present (so CI works),
   and warns when a real `node_modules` copy shadows the linked Pi release.
 
+### Meta
+
+- Released under the MIT license.
+
 ### Documentation
 
 - Added install instructions, the `/remote jobs` verb, and the rsync, stream

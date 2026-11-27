@@ -63,4 +63,4 @@ npm run format:check
 
 `package-lock.json` is not committed: its peer-dependency entries point inside the local Pi install, so the same file cannot describe another machine.
 
-Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+Changes are listed in [CHANGELOG.md](CHANGELOG.md). Released under the [MIT license](LICENSE).
