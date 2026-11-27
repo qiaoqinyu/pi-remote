@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -66,13 +67,15 @@ export function jobCommand(job: Job, action: Action | "submit", input = "") {
     );
   }
   if (job.backend === "slurm") {
-    const id = `IFS=';' read -r jid cluster <"$d/slurm"; [[ $jid =~ ^[0-9]+$ ]]; opts=(); if [[ -n $cluster ]]; then opts=(-M "$cluster"); fi\n`;
+    // Positional parameters, not an array: `"${opts[@]}"` on an empty array is an
+    // unbound-variable error under `set -u` in bash before 4.4 (RHEL/CentOS 7).
+    const id = `IFS=';' read -r jid cluster <"$d/slurm"; [[ $jid =~ ^[0-9]+$ ]]; set --; if [[ -n $cluster ]]; then set -- -M "$cluster"; fi\n`;
     return (
       pre +
       id +
       (action === "cancel"
-        ? 'scancel "${opts[@]}" "$jid"; echo "cancel requested: $jid"'
-        : 'state=$(squeue "${opts[@]}" -h -j "$jid" -o %T 2>/dev/null) || state=\'\'; if [[ -z $state ]]; then state=$(sacct "${opts[@]}" -Xnj "$jid" -o State -P); fi; printf \'%s %s\\n\' "$jid" "${state:-unknown}"')
+        ? 'scancel "$@" "$jid"; echo "cancel requested: $jid"'
+        : 'state=$(squeue "$@" -h -j "$jid" -o %T 2>/dev/null) || state=\'\'; if [[ -z $state ]]; then state=$(sacct "$@" -Xnj "$jid" -o State -P); fi; printf \'%s %s\\n\' "$jid" "${state:-unknown}"')
     );
   }
   if (action === "cancel") {
@@ -91,6 +94,54 @@ function marker(job: Job): string {
   return `__PI_REMOTE_JOB_${job.id}__`;
 }
 
+/** sshd rejects one argv string beyond 128 KiB, so keep batches well below it. */
+const STATUS_BATCH_BYTES = 32 * 1024;
+
+function statusCommand(jobs: Job[]): string {
+  return jobs
+    .map(
+      (job) =>
+        `printf '%s\\n' ${shQuote(marker(job))}\n( ${jobCommand(job, "status")} ) || printf 'unknown: status command exited %s\\n' "$?"`,
+    )
+    .join("\n");
+}
+
+/** Group jobs so one SSH call's script stays inside the command size limit. */
+function statusBatches(jobs: Job[]): Job[][] {
+  const batches: Job[][] = [];
+  let current: Job[] = [];
+  let bytes = 0;
+  for (const job of jobs) {
+    const size = statusCommand([job]).length + 1;
+    if (current.length && bytes + size > STATUS_BATCH_BYTES) {
+      batches.push(current);
+      current = [];
+      bytes = 0;
+    }
+    current.push(job);
+    bytes += size;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function parseStates(stdout: string, jobs: Job[]): Map<string, string> {
+  const markers = new Map(jobs.map((job) => [marker(job), job.id]));
+  const states = new Map<string, string[]>(jobs.map((job) => [job.id, []]));
+  let current: string | undefined;
+  for (const line of stdout.split("\n")) {
+    const marked = markers.get(line.trim());
+    if (marked) current = marked;
+    else if (current) states.get(current)?.push(line);
+  }
+  return new Map(
+    jobs.map((job) => [
+      job.id,
+      states.get(job.id)?.join("\n").trim() || "unknown",
+    ]),
+  );
+}
+
 export function registerJobs(
   pi: ExtensionAPI,
   control: ControlDir,
@@ -101,9 +152,18 @@ export function registerJobs(
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const jobs: Job[] = [];
     const warnings: string[] = [];
-    for (const name of readdirSync(dir)
+    // Newest first: the job to look at is almost always the one just submitted.
+    const names = readdirSync(dir)
       .filter((name) => /^[a-f0-9-]{36}\.json$/.test(name))
-      .sort()) {
+      .map((name) => {
+        try {
+          return { name, mtime: statSync(join(dir, name)).mtimeMs };
+        } catch {
+          return { name, mtime: 0 };
+        }
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const { name } of names) {
       try {
         const job = JSON.parse(readFileSync(join(dir, name), "utf8")) as Job;
         if (
@@ -154,49 +214,32 @@ export function registerJobs(
     return result.stdout.trim();
   }
 
-  /** One SSH invocation per host, rather than one per job. */
+  /** One SSH call per batch, so a long job list cannot overflow the command. */
   async function batchStatus(
     host: string,
     jobs: Job[],
     signal?: AbortSignal,
   ): Promise<Map<string, string>> {
-    const command = jobs
-      .map(
-        (job) =>
-          `printf '%s\\n' ${shQuote(marker(job))}\n( ${jobCommand(job, "status")} ) || printf 'unknown: status command exited %s\\n' "$?"`,
-      )
-      .join("\n");
-    const result = await remoteExec(control, host, command, {
-      timeoutSeconds: Math.min(300, 30 + jobs.length * 10),
-      signal,
-    });
-    if (
-      result.exitCode !== 0 ||
-      result.timedOut ||
-      result.aborted ||
-      result.connectFailed
-    ) {
-      throw new Error(
-        result.stderr.trim() || `Status request failed (${result.exitCode})`,
-      );
-    }
-    const markers = new Map(jobs.map((job) => [marker(job), job.id]));
-    const states = new Map<string, string[]>(jobs.map((job) => [job.id, []]));
-    let current: string | undefined;
-    for (const line of result.stdout.split("\n")) {
-      const marked = markers.get(line.trim());
-      if (marked) {
-        current = marked;
-      } else if (current) {
-        states.get(current)?.push(line);
+    const states = new Map<string, string>();
+    for (const batch of statusBatches(jobs)) {
+      const result = await remoteExec(control, host, statusCommand(batch), {
+        timeoutSeconds: Math.min(300, 30 + batch.length * 10),
+        signal,
+      });
+      if (
+        result.exitCode !== 0 ||
+        result.timedOut ||
+        result.aborted ||
+        result.connectFailed
+      ) {
+        throw new Error(
+          result.stderr.trim() || `Status request failed (${result.exitCode})`,
+        );
       }
+      for (const [id, state] of parseStates(result.stdout, batch))
+        states.set(id, state);
     }
-    return new Map(
-      jobs.map((job) => [
-        job.id,
-        states.get(job.id)?.join("\n").trim() || "unknown",
-      ]),
-    );
+    return states;
   }
 
   async function list(signal?: AbortSignal) {

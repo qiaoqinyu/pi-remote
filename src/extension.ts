@@ -13,7 +13,11 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { CacheFile, pruneCache } from "./cache.ts";
 import { registerJobs } from "./jobs.ts";
-import { checkAlias } from "./script.ts";
+import {
+  checkAlias,
+  DEFAULT_TIMEOUT_SECONDS,
+  validateTimeout,
+} from "./script.ts";
 import {
   CONTROL_PERSIST,
   ControlDir,
@@ -22,9 +26,10 @@ import {
 } from "./ssh.ts";
 
 const CWD_ENTRY = "remote-cwd";
-const DEFAULT_TIMEOUT_SECONDS = 120;
 const SYNC_TIMEOUT_SECONDS = 600;
 const STATUS_REFRESH_MS = 60_000;
+/** Chunks arrive far faster than a terminal can use them; one frame per 100 ms is enough. */
+const PREVIEW_INTERVAL_MS = 100;
 
 function spill(text: string): string {
   const cache = new CacheFile();
@@ -192,6 +197,24 @@ export function registerRemote(
         params.cwd === undefined ? cwds.get(host) : undefined;
       let streamed = "";
       let lastStream: "stdout" | "stderr" | undefined;
+      let pendingPreview: string | undefined;
+      let previewTimer: NodeJS.Timeout | undefined;
+      let lastPreview = 0;
+      const flushPreview = () => {
+        previewTimer = undefined;
+        if (pendingPreview === undefined) return;
+        const text = pendingPreview;
+        pendingPreview = undefined;
+        lastPreview = Date.now();
+        onUpdate?.({ content: [{ type: "text", text }], details: {} });
+      };
+      const schedulePreview = () => {
+        pendingPreview = streamed;
+        if (previewTimer) return;
+        const wait = PREVIEW_INTERVAL_MS - (Date.now() - lastPreview);
+        if (wait <= 0) flushPreview();
+        else previewTimer = setTimeout(flushPreview, wait);
+      };
       const result = await remoteExec(control, host, params.command, {
         cwd: params.cwd ?? rememberedCwd,
         timeoutSeconds: params.timeout ?? DEFAULT_TIMEOUT_SECONDS,
@@ -203,14 +226,15 @@ export function registerRemote(
             lastStream = stream;
           }
           streamed = (streamed + chunk).slice(-8192);
-          onUpdate?.({
-            content: [{ type: "text", text: streamed }],
-            details: {},
-          });
+          schedulePreview();
         },
       });
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = undefined;
+      }
       let clearedCwd = false;
-      if (rememberedCwd && result.exitCode === 97 && !result.cwd) {
+      if (rememberedCwd && result.cwdFailed) {
         cwds.delete(host);
         pi.appendEntry(CWD_ENTRY, { host, cwd: null });
         clearedCwd = true;
@@ -268,13 +292,7 @@ export function registerRemote(
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const host = checkAlias(params.host);
-      const timeout = params.timeout ?? SYNC_TIMEOUT_SECONDS;
-      if (
-        !Number.isFinite(timeout) ||
-        timeout <= 0 ||
-        timeout * 1000 > 2147483647
-      )
-        throw new Error("Invalid timeout");
+      const timeout = validateTimeout(params.timeout ?? SYNC_TIMEOUT_SECONDS);
       control.ensure();
       const { local, remoteSpec } = resolveSyncPaths(
         host,
@@ -286,7 +304,8 @@ export function registerRemote(
       const args = [
         "-az",
         "--partial",
-        "--info=stats1,progress0",
+        "--stats",
+        // rsync 3.0+: without it the remote shell would word-split every path.
         "-s",
         "-e",
         ["ssh", ...control.sshOptions(host)].join(" "),
@@ -364,7 +383,7 @@ export function registerRemote(
 
   pi.registerCommand("remote", {
     description:
-      "List, refresh, inspect, or disconnect SSH connections that Pi opened for the remote tools",
+      "List connections or jobs, refresh, or disconnect SSH connections that Pi opened for the remote tools",
     getArgumentCompletions: (prefix) => {
       const [verb = "", arg] = prefix.split(" ");
       if (arg === undefined) {

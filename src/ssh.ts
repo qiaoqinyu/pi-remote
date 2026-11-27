@@ -3,7 +3,12 @@ import { chmodSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { Capture } from "./capture.ts";
-import { buildRemoteCommand, checkAlias, parseStderr } from "./script.ts";
+import {
+  buildRemoteCommand,
+  checkAlias,
+  markerLinePattern,
+  parseStderr,
+} from "./script.ts";
 
 /** Idle masters exit on their own after this, even if Pi crashes. */
 export const CONTROL_PERSIST = "30m";
@@ -16,6 +21,8 @@ export interface ExecResult {
   stderr: string;
   /** Working directory when the remote shell exited; undefined if it never reported one. */
   cwd?: string;
+  /** The requested cwd could not be entered, so the command never ran. */
+  cwdFailed: boolean;
   /** True when the command never started on the remote side (ssh itself failed). */
   connectFailed: boolean;
   timedOut: boolean;
@@ -200,14 +207,16 @@ export function remoteExec(
         stdio: ["pipe", "pipe", "pipe"],
       },
     );
+    const markerLine = markerLinePattern(script.nonce);
+    // The tail of stderr stays raw so the markers can be parsed; the cached copy
+    // is what the model reads, so it keeps only the command's own output.
     const out = new Capture();
-    const err = new Capture();
+    const err = new Capture(undefined, {
+      keepLine: (line) => !markerLine.test(line),
+    });
     const outDecoder = new StringDecoder("utf8");
     const errDecoder = new StringDecoder("utf8");
     let errPreview = "";
-    const markerLine = new RegExp(
-      `^${script.nonce} (?:READY|PID \\d+|CWD .*|STOP|DETACHED)\\r?$`,
-    );
     const streamStderr = (text: string, final = false) => {
       errPreview += text;
       const lines = errPreview.split("\n");
@@ -216,7 +225,7 @@ export function remoteExec(
       for (const line of lines) {
         if (markerLine.test(line)) {
           if (
-            /(?: CWD | STOP$| DETACHED$)/.test(line) &&
+            /(?: CWD | CD_FAILED$| STOP$| DETACHED$)/.test(line) &&
             visibleLines.at(-1) === ""
           )
             visibleLines.pop();
@@ -291,7 +300,13 @@ export function remoteExec(
     });
     child.on("error", (error) => {
       clearTimeout(timer);
-      reject(error);
+      clearTimeout(cutoff);
+      options.signal?.removeEventListener("abort", onAbort);
+      reject(
+        (error as NodeJS.ErrnoException).code === "ENOENT"
+          ? new Error("ssh is not installed on this machine")
+          : error,
+      );
     });
     child.on("close", (code) => {
       clearTimeout(timer);
@@ -319,6 +334,7 @@ export function remoteExec(
         stopAcknowledged,
         stderr: parsed.stderr,
         cwd: parsed.cwd,
+        cwdFailed: parsed.cwdFailed === true,
         connectFailed: !startedRemote,
         timedOut: timedOut || (stopAcknowledged && !aborted),
         aborted,

@@ -1,2 +1,5 @@
 node_modules/
 *.tsbuildinfo
+# The lockfile records peer-dependency paths inside the local Pi install, so it
+# is machine-specific and cannot be reproduced on another checkout.
+package-lock.json

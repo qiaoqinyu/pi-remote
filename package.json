@@ -1,6 +1,6 @@
 {
   "name": "pi-remote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Run commands, sync files, and track jobs on SSH hosts; /remote lists and disconnects Pi-owned connections.",

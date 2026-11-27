@@ -29,6 +29,15 @@ export function remotePath(path: string): string {
   return shQuote(path);
 }
 
+export const DEFAULT_TIMEOUT_SECONDS = 120;
+
+/** One rule for every timeout that reaches `setTimeout` or a remote deadline. */
+export function validateTimeout(seconds: number): number {
+  if (!Number.isFinite(seconds) || seconds <= 0 || seconds * 1000 > 2147483647)
+    throw new Error("Invalid timeout");
+  return seconds;
+}
+
 export interface RemoteScript {
   /** Argument for `ssh host <remoteCommand>`; safe for any POSIX login shell. */
   remoteCommand: string;
@@ -42,14 +51,9 @@ export interface RemoteScript {
 export function buildRemoteCommand(
   command: string,
   cwd?: string,
-  timeoutSeconds = 120,
+  timeoutSeconds: number = DEFAULT_TIMEOUT_SECONDS,
 ): RemoteScript {
-  if (
-    !Number.isFinite(timeoutSeconds) ||
-    timeoutSeconds <= 0 ||
-    timeoutSeconds * 1000 > 2147483647
-  )
-    throw new Error("Invalid timeout");
+  validateTimeout(timeoutSeconds);
   if (Buffer.byteLength(command) > MAX_COMMAND_BYTES) {
     throw new Error(
       `Command exceeds ${MAX_COMMAND_BYTES} bytes; copy a script with remote_sync and run it instead.`,
@@ -58,7 +62,11 @@ export function buildRemoteCommand(
   const nonce = `__PI_REMOTE_${randomBytes(8).toString("hex")}__`;
   const lines = [
     `printf '%s PID %s\\n' '${nonce}' "$$" >&2`,
-    ...(cwd === undefined ? [] : [`cd -- ${remotePath(cwd)} || exit 97`]),
+    ...(cwd === undefined
+      ? []
+      : [
+          `cd -- ${remotePath(cwd)} || { printf '\\n%s CD_FAILED\\n' '${nonce}' >&2; exit 97; }`,
+        ]),
     `trap 'printf "\\n%s CWD %s\\n" "${nonce}" "$PWD" >&2' EXIT`,
     command,
     "",
@@ -117,10 +125,19 @@ while True:
   return { nonce, remoteCommand };
 }
 
+/** Every line the wrapper writes to stderr; previews and cached files keep none of them. */
+export function markerLinePattern(nonce: string): RegExp {
+  return new RegExp(
+    `^${nonce} (?:READY|PID \\d+|CWD .*|CD_FAILED|STOP|DETACHED)\\r?$`,
+  );
+}
+
 export interface ParsedStderr {
   stderr: string;
   pid?: number;
   cwd?: string;
+  /** The requested cwd could not be entered; the command never ran. */
+  cwdFailed?: boolean;
   shellStarted?: boolean;
   detached?: boolean;
 }
@@ -132,6 +149,11 @@ export function parseStderr(raw: string, nonce: string): ParsedStderr {
   if (result.stderr.includes(readyLine)) {
     result.shellStarted = true;
     result.stderr = result.stderr.replace(readyLine, "");
+  }
+  const cwdFailedMarker = `\n${nonce} CD_FAILED\n`;
+  if (result.stderr.includes(cwdFailedMarker)) {
+    result.cwdFailed = true;
+    result.stderr = result.stderr.replace(cwdFailedMarker, "");
   }
   const detachedMarker = `\n${nonce} DETACHED`;
   if (result.stderr.includes(detachedMarker)) {

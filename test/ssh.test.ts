@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -92,6 +98,28 @@ test("remoteExec streams stderr without protocol markers and preserves split UTF
   }
 });
 
+test("cached stderr is the command's output, without wrapper markers", async () => {
+  const t = controlDir();
+  try {
+    const lines = Array.from({ length: 2500 }, (_, i) => `e${i}`);
+    const result = await withFakeSsh("passthrough", () =>
+      remoteExec(t.control, "host", `printf '%s\\n' ${lines.join(" ")} >&2`, {
+        timeoutSeconds: 20,
+      }),
+    );
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.files.length, 1);
+    const cached = readFileSync(result.files[0], "utf8");
+    assert.doesNotMatch(cached, /__PI_REMOTE/);
+    const kept = cached.split("\n").filter((line) => line !== "");
+    assert.equal(kept.length, 2500);
+    assert.equal(kept[0], "e0");
+    assert.equal(kept.at(-1), "e2499");
+  } finally {
+    t.cleanup();
+  }
+});
+
 test("remoteExec abort acknowledges remote process-group cancellation", async () => {
   const t = controlDir();
   try {
@@ -109,6 +137,26 @@ test("remoteExec abort acknowledges remote process-group cancellation", async ()
     assert.equal(result.stopAcknowledged, true);
     assert.equal(result.exitCode, 124);
     assert.ok(result.durationMs < 5000);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("the live preview never shows wrapper markers, including a cwd failure", async () => {
+  const t = controlDir();
+  try {
+    const previews: string[] = [];
+    const result = await withFakeSsh("passthrough", () =>
+      remoteExec(t.control, "host", "pwd", {
+        cwd: "/definitely/not/here",
+        timeoutSeconds: 5,
+        onOutput: (text) => previews.push(text),
+      }),
+    );
+    assert.equal(result.cwdFailed, true);
+    assert.equal(result.exitCode, 97);
+    assert.match(previews.join(""), /No such file or directory/);
+    assert.doesNotMatch(previews.join(""), /__PI_REMOTE/);
   } finally {
     t.cleanup();
   }

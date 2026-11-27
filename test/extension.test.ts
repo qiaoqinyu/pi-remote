@@ -289,3 +289,298 @@ test("remote_job list skips corrupt records and forget removes only valid local 
     t.cleanup();
   }
 });
+
+/** Route ssh through a local shell so the wrapper protocol runs end to end. */
+async function withLocalSsh<T>(
+  t: ReturnType<typeof setup>,
+  run: () => Promise<T>,
+): Promise<T> {
+  const bin = join(t.dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "ssh"), '#!/bin/bash\nexec sh -c "${!#}"\n', {
+    mode: 0o700,
+  });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  try {
+    return await run();
+  } finally {
+    process.env.PATH = oldPath;
+  }
+}
+
+test("remote clears a remembered cwd only when the wrapper reports it missing", async () => {
+  const t = setup();
+  try {
+    const remote = t.tools.get("remote")!;
+    const gone = join(t.dir, "gone");
+    mkdirSync(gone);
+    await withLocalSsh(t, () =>
+      remote.execute(
+        "id",
+        { host: "h1", command: "pwd", cwd: gone },
+        undefined,
+        undefined,
+        t.ctx,
+      ),
+    );
+    rmSync(gone, { recursive: true, force: true });
+    const afterMissing = await withLocalSsh(t, () =>
+      remote.execute(
+        "id",
+        { host: "h1", command: "pwd" },
+        undefined,
+        undefined,
+        t.ctx,
+      ),
+    );
+    assert.match(
+      afterMissing.content[0].text,
+      /remembered cwd was unavailable and has been cleared: .*gone/i,
+    );
+    assert.deepEqual(
+      t.entries.filter((entry) => entry.customType === "remote-cwd").at(-1)
+        ?.data,
+      { host: "h1", cwd: null },
+    );
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote keeps a remembered cwd when a command resets traps and exits 97", async () => {
+  const t = setup();
+  try {
+    const remote = t.tools.get("remote")!;
+    await withLocalSsh(t, () =>
+      remote.execute(
+        "id",
+        { host: "h1", command: "pwd", cwd: "/tmp" },
+        undefined,
+        undefined,
+        t.ctx,
+      ),
+    );
+    const own = await withLocalSsh(t, () =>
+      remote.execute(
+        "id",
+        { host: "h1", command: "trap - EXIT; exit 97" },
+        undefined,
+        undefined,
+        t.ctx,
+      ),
+    );
+    assert.equal(own.isError, true);
+    assert.match(own.content[0].text, /exit 97/);
+    assert.doesNotMatch(own.content[0].text, /has been cleared/);
+    const next = await withLocalSsh(t, () =>
+      remote.execute(
+        "id",
+        { host: "h1", command: "pwd" },
+        undefined,
+        undefined,
+        t.ctx,
+      ),
+    );
+    assert.match(next.content[0].text, /cwd \/tmp/);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote_sync works with an rsync that rejects modern options", async () => {
+  const t = setup();
+  const oldPath = process.env.PATH;
+  try {
+    const bin = join(t.dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "rsync"),
+      `#!/bin/bash
+for arg in "$@"; do
+  case $arg in
+    --info*|--protect-args*) echo "rsync: $arg: unknown option" >&2; exit 1 ;;
+  esac
+done
+echo "sent"
+`,
+      { mode: 0o700 },
+    );
+    process.env.PATH = `${bin}:${oldPath}`;
+    const result = await t.tools
+      .get("remote_sync")!
+      .execute(
+        "id",
+        { host: "h1", direction: "push", local: "source", remote: "/tmp/dest" },
+        undefined,
+        undefined,
+        t.ctx,
+      );
+    assert.equal(result.isError, undefined);
+    assert.match(result.content[0].text, /sent/);
+  } finally {
+    process.env.PATH = oldPath;
+    t.cleanup();
+  }
+});
+
+test("remote and remote_sync reject the same invalid timeouts", async () => {
+  const t = setup();
+  try {
+    for (const timeout of [0, -1, Number.NaN, 3_000_000]) {
+      await assert.rejects(
+        t.tools
+          .get("remote")!
+          .execute(
+            "id",
+            { host: "h1", command: "true", timeout },
+            undefined,
+            undefined,
+            t.ctx,
+          ),
+        /Invalid timeout/,
+        `remote accepted timeout ${timeout}`,
+      );
+      await assert.rejects(
+        t.tools.get("remote_sync")!.execute(
+          "id",
+          {
+            host: "h1",
+            direction: "push",
+            local: "a",
+            remote: "b",
+            timeout,
+          },
+          undefined,
+          undefined,
+          t.ctx,
+        ),
+        /Invalid timeout/,
+        `remote_sync accepted timeout ${timeout}`,
+      );
+    }
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote_job list still works when many jobs are registered", async () => {
+  const t = setup();
+  try {
+    const jobsDir = join(t.dir, "remote-jobs");
+    mkdirSync(jobsDir, { recursive: true });
+    const ids: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      const id = randomUUID();
+      ids.push(id);
+      writeFileSync(
+        join(jobsDir, `${id}.json`),
+        JSON.stringify({ id, host: "h1", name: `job-${i}`, backend: "slurm" }),
+      );
+    }
+    const listed = await withLocalSsh(t, () =>
+      t.tools
+        .get("remote_job")!
+        .execute("id", { action: "list" }, undefined, undefined, t.ctx),
+    );
+    const text = listed.content[0].text;
+    assert.doesNotMatch(text, /exceeds/);
+    for (const id of ids) assert.match(text, new RegExp(id));
+    // Every job reached the remote side; a batch that overflows the command
+    // limit would instead report the encode error once per host.
+    const queried = text
+      .split("\n")
+      .filter((line) => line.endsWith("unknown: status command exited 1"));
+    assert.equal(queried.length, 200);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote_job list shows the newest registration first", async () => {
+  const t = setup();
+  try {
+    const jobsDir = join(t.dir, "remote-jobs");
+    mkdirSync(jobsDir, { recursive: true });
+    const older = randomUUID();
+    const newer = randomUUID();
+    for (const [id, name] of [
+      [older, "older"],
+      [newer, "newer"],
+    ] as const)
+      writeFileSync(
+        join(jobsDir, `${id}.json`),
+        JSON.stringify({ id, host: "h1", name, backend: "slurm" }),
+      );
+    const past = new Date(Date.now() - 60_000);
+    execFileSync("touch", [
+      "-m",
+      "-d",
+      past.toISOString(),
+      join(jobsDir, `${older}.json`),
+    ]);
+    const listed = await withLocalSsh(t, () =>
+      t.tools
+        .get("remote_job")!
+        .execute("id", { action: "list" }, undefined, undefined, t.ctx),
+    );
+    const order = listed.content[0].text
+      .split("\n")
+      .map((line) => line.split(/\s+/)[1]);
+    assert.deepEqual(order, ["newer", "older"]);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("remote explains a missing ssh binary instead of reporting a spawn error", async () => {
+  const t = setup();
+  const oldPath = process.env.PATH;
+  try {
+    process.env.PATH = "/nonexistent";
+    await assert.rejects(
+      t.tools
+        .get("remote")!
+        .execute(
+          "id",
+          { host: "h1", command: "true" },
+          undefined,
+          undefined,
+          t.ctx,
+        ),
+      /ssh is not installed on this machine/,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+    t.cleanup();
+  }
+});
+
+test("remote throttles preview updates and still shows the final output", async () => {
+  const t = setup();
+  try {
+    const previews: string[] = [];
+    const result = await withLocalSsh(t, () =>
+      t.tools.get("remote")!.execute(
+        "id",
+        {
+          host: "h1",
+          command: "for i in $(seq 200); do echo line-$i; sleep 0.003; done",
+        },
+        undefined,
+        (update: { content: Array<{ text: string }> }) =>
+          previews.push(update.content[0].text),
+        t.ctx,
+      ),
+    );
+    assert.equal(result.isError, undefined);
+    assert.match(result.content[0].text, /line-200/);
+    assert.ok(previews.length > 0, "expected at least one preview update");
+    assert.ok(
+      previews.length < 50,
+      `expected throttled updates, got ${previews.length}`,
+    );
+  } finally {
+    t.cleanup();
+  }
+});

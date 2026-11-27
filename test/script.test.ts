@@ -81,3 +81,14 @@ test("commands cannot read the script from stdin, and output lacking markers is 
 test("oversized commands are rejected before reaching ssh", () => {
   assert.throws(() => buildRemoteCommand("x".repeat(70 * 1024)), /exceeds/);
 });
+
+test("a missing cwd reports CD_FAILED instead of a bare exit code", () => {
+  const missing = runLocally("pwd", "/nonexistent-pi-remote");
+  assert.equal(missing.code, 97);
+  assert.equal(parseStderr(missing.stderr, missing.nonce).cwdFailed, true);
+
+  // A command that exits 97 on its own must keep its own status and cwd.
+  const own = runLocally("exit 97");
+  assert.equal(own.code, 97);
+  assert.equal(parseStderr(own.stderr, own.nonce).cwdFailed, undefined);
+});
