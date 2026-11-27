@@ -1,0 +1,40 @@
+{
+  "name": "pi-remote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Run commands, sync files, and track jobs on SSH hosts; /remote lists and disconnects Pi-owned connections.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ssh",
+    "remote",
+    "rsync"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "link:deps": "node test/link-deps.mjs",
+    "pretest": "npm run link:deps",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "npm run link:deps && tsc --noEmit",
+    "format": "prettier --write src extensions test package.json tsconfig.json README.md",
+    "format:check": "prettier --check src extensions test package.json tsconfig.json README.md"
+  }
+}
